@@ -128,26 +128,34 @@ async function checkCard(env: Env, card: string): Promise<{
       body,
     });
 
-    if (!res.ok) return { status: "error", message: "Gateway error", binInfo: "" };
+    if (!res.ok) {
+      return { status: "error", message: `Gateway error: ${res.status}`, binInfo: "" };
+    }
 
     const json: any = await res.json();
-    const html = json.msg || "";
-
+    const html = json.msg || json.message || "";
+    
     const bin = cc.slice(0, 6);
     const binInfo = await getBinInfo(bin);
 
-    // Parse response
-    if (html.includes("color:#008000") && html.includes("Live")) {
-      return { status: "live", message: html.replace(/<[^>]*>/g, "").trim(), binInfo };
-    } else if (html.includes("color:#FF0000") && html.includes("Die")) {
-      return { status: "die", message: html.replace(/<[^>]*>/g, "").trim(), binInfo };
-    } else if (html.includes("color:#800080") && html.includes("Unknown")) {
-      return { status: "unknown", message: html.replace(/<[^>]*>/g, "").trim(), binInfo };
+    // Clean the HTML response
+    const cleanMsg = html.replace(/<[^>]*>/g, "").trim();
+
+    // Parse response - check for keywords
+    const lowerHtml = html.toLowerCase();
+    
+    if (lowerHtml.includes("live") || lowerHtml.includes("approved") || lowerHtml.includes("success")) {
+      return { status: "live", message: cleanMsg || "Approved", binInfo };
+    } else if (lowerHtml.includes("die") || lowerHtml.includes("declined") || lowerHtml.includes("failed")) {
+      return { status: "die", message: cleanMsg || "Declined", binInfo };
+    } else if (lowerHtml.includes("unknown") || lowerHtml.includes("pending")) {
+      return { status: "unknown", message: cleanMsg || "Unknown", binInfo };
     } else {
-      return { status: "error", message: "Unknown response", binInfo };
+      // If no clear status, return the raw response
+      return { status: "error", message: cleanMsg || "No response", binInfo };
     }
-  } catch (e) {
-    return { status: "error", message: "Request failed", binInfo: "" };
+  } catch (e: any) {
+    return { status: "error", message: e.message || "Request failed", binInfo: "" };
   }
 }
 
@@ -223,9 +231,11 @@ export default {
 <code>/gen bin amount</code> – Generate cards
 <code>/chk</code> – Check cards (cc|mm|yy|cvv)
 <code>/bin bin</code> – Lookup BIN info
+<code>/test card</code> – Test single card with debug info
 
 <b>📝 Example:</b>
 <code>/gen 486796 10</code>
+<code>/test 5154620020062707|02|2028|144</code>
 
 <b>Supported Networks:</b>
 • Visa (4xxxxx)
@@ -283,6 +293,32 @@ export default {
         return new Response("ok");
       }
 
+      // ————— /test —————
+      if (cmd === "/test" && args[0]) {
+        const testCard = args[0];
+        if (!/^\d{15,19}\|\d{2}\|\d{2,4}\|\d{3,4}$/.test(testCard)) {
+          await sendMessage(env, chatId, "❌ Invalid format. Use: <code>/test 5154620020062707|02|2028|144</code>", "HTML");
+          return new Response("ok");
+        }
+
+        await sendMessage(env, chatId, "🔍 Testing card...", "HTML");
+        
+        const result = await checkCard(env, testCard);
+        
+        const debugInfo = `<b>🔬 Debug Test Result</b>
+
+<b>Card:</b> <code>${testCard}</code>
+
+<b>Status:</b> ${result.status}
+<b>Message:</b> <code>${escapeHtml(result.message)}</code>
+
+<b>BIN Info:</b>
+${result.binInfo}`;
+
+        await sendMessage(env, chatId, debugInfo, "HTML");
+        return new Response("ok");
+      }
+
       // ————— /chk —————
       if (cmd === "/chk") {
         const lines = text
@@ -295,7 +331,7 @@ export default {
           await sendMessage(
             env, 
             chatId, 
-            "<b>ℹ️ Send cards in format:</b>\n<code>6011201234567890|07|32|839</code>\n\n<i>You can send multiple cards, one per line</i>", 
+            "<b>ℹ️ Send cards in format:</b>\n<code>6011201234567890|07|32|839</code>\n\n<i>You can send multiple cards, one per line (max 30)</i>", 
             "HTML"
           );
           return new Response("ok");
@@ -329,8 +365,10 @@ export default {
           const icon = res.status === "live" ? "✅" : res.status === "die" ? "❌" : res.status === "unknown" ? "⚠️" : "🚫";
           const statusText = res.status === "live" ? "Approved" : res.status === "die" ? "Declined" : res.status === "unknown" ? "Unknown" : "Error";
           
+          const responseMsg = res.message ? `<i>${escapeHtml(res.message)}</i>` : '';
+          
           results.push(
-            `${icon} <b>${statusText}</b>\n<code>${card}</code>\n${res.binInfo}`
+            `${icon} <b>${statusText}</b>\n<code>${card}</code>\n${responseMsg ? responseMsg + '\n' : ''}${res.binInfo}`
           );
 
           // Update progress every 3 cards or on last card
