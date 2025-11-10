@@ -7,6 +7,36 @@ interface Env {
   RATE_KV?: KVNamespace;
 }
 
+// ———————————————————————— BIN Ranges ————————————————————————
+const BIN_RANGES = {
+  visa: [
+    { start: 400000, end: 499999 }
+  ],
+  mastercard: [
+    { start: 222100, end: 272099 },
+    { start: 510000, end: 559999 }
+  ],
+  amex: [
+    { start: 340000, end: 349999 },
+    { start: 370000, end: 379999 }
+  ],
+  discover: [
+    { start: 601100, end: 601199 },
+    { start: 644000, end: 659999 }
+  ],
+  jcb: [
+    { start: 352800, end: 358999 }
+  ],
+  diners: [
+    { start: 300000, end: 305999 },
+    { start: 360000, end: 369999 },
+    { start: 380000, end: 399999 }
+  ],
+  cup: [
+    { start: 620000, end: 629999 }
+  ]
+};
+
 // ———————————————————————— Luhn Algorithm ————————————————————————
 function luhnGenerate(prefix: string, length: number): string {
   let number = prefix;
@@ -28,6 +58,18 @@ function luhnGenerate(prefix: string, length: number): string {
   return number + check;
 }
 
+function isValidBin(bin: string): boolean {
+  const binNum = parseInt(bin);
+  for (const network of Object.values(BIN_RANGES)) {
+    for (const range of network) {
+      if (binNum >= range.start && binNum <= range.end) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // ———————————————————————— BIN Lookup ————————————————————————
 interface BinData {
   number: { iin: string; length: number; luhn: boolean };
@@ -36,7 +78,6 @@ interface BinData {
   category: string;
   bank: { name?: string; phone?: string; url?: string };
   country: { name: string; emoji: string };
-  success: boolean;
 }
 
 async function getBinInfo(bin: string): Promise<string> {
@@ -44,8 +85,6 @@ async function getBinInfo(bin: string): Promise<string> {
     const res = await fetch(`https://binlist.io/lookup/${bin}/`);
     if (!res.ok) return "❌ BIN lookup failed";
     const data: BinData = await res.json();
-
-    if (!data.success) return "❌ BIN not found";
 
     return (
       `<b>BIN:</b> <code>${bin}</code>\n` +
@@ -116,16 +155,28 @@ async function checkCard(env: Env, card: string): Promise<{
 function generateCards(bin: string, amount: number): string[] {
   const cards: string[] = [];
   const length = 16;
-  const prefix = bin.padEnd(length, "0").slice(0, length);
+  
+  // Validate BIN is in valid range
+  if (!isValidBin(bin)) {
+    return [];
+  }
 
   for (let i = 0; i < amount; i++) {
-    const cc = luhnGenerate(prefix.slice(0, length - 1), length);
+    const prefix = bin.padEnd(length - 1, "0").slice(0, length - 1);
+    const cc = luhnGenerate(prefix, length);
     const mm = String(Math.floor(Math.random() * 12) + 1).padStart(2, "0");
     const yy = String(26 + Math.floor(Math.random() * 8)).padStart(2, "0");
     const cvv = String(100 + Math.floor(Math.random() * 900));
     cards.push(`${cc}|${mm}|${yy}|${cvv}`);
   }
   return cards;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 // ———————————————————————— Main Handler ————————————————————————
@@ -156,8 +207,8 @@ export default {
         const now = Date.now();
         const recent = ((await env.RATE_KV.get(key, { type: "json" })) as number[]) || [];
         const valid = recent.filter(t => now - t < 60_000);
-        if (valid.length > 3 && !["/start", "/help"].includes(cmd)) {
-          await sendMessage(env, chatId, "Rate limit: 3 commands/min");
+        if (valid.length >= 3 && !["/start", "/help", "/bin"].includes(cmd)) {
+          await sendMessage(env, chatId, "⚠️ Rate limit: 3 commands/min", "HTML");
           return new Response("ok");
         }
         valid.push(now);
@@ -166,18 +217,25 @@ export default {
 
       // ————— /start —————
       if (cmd === "/start") {
-        const welcome = `
-*CC Checker & Generator Bot* 
+        const welcome = `<b>💳 CC Checker &amp; Generator Bot</b>
 
-*Commands:*
-/gen bin amount – Generate cards
-/chk – Paste cards (cc|mm|yy|cvv)
-/bin bin – Lookup BIN info
+<b>📋 Commands:</b>
+<code>/gen bin amount</code> – Generate cards
+<code>/chk</code> – Check cards (cc|mm|yy|cvv)
+<code>/bin bin</code> – Lookup BIN info
 
-*Example:*  
-/gen 486796 10
-        `.trim();
-        await sendMessage(env, chatId, welcome, "Markdown");
+<b>📝 Example:</b>
+<code>/gen 486796 10</code>
+
+<b>Supported Networks:</b>
+• Visa (4xxxxx)
+• Mastercard (51-55, 2221-2720)
+• Amex (34, 37)
+• Discover (6011, 644-659)
+• JCB (3528-3589)
+• Diners (300-305, 36-39)
+• UnionPay (62)`;
+        await sendMessage(env, chatId, welcome, "HTML");
         return new Response("ok");
       }
 
@@ -185,18 +243,29 @@ export default {
       if (cmd === "/gen" && args.length >= 2) {
         const bin = args[0].replace(/\D/g, "").slice(0, 6);
         const amount = Math.min(parseInt(args[1]) || 10, 50);
+        
         if (bin.length < 6) {
-          await sendMessage(env, chatId, "Invalid BIN (min 6 digits)");
+          await sendMessage(env, chatId, "❌ Invalid BIN (minimum 6 digits required)", "HTML");
+          return new Response("ok");
+        }
+
+        if (!isValidBin(bin)) {
+          await sendMessage(env, chatId, "❌ Invalid BIN - not in valid card network range", "HTML");
           return new Response("ok");
         }
 
         const cards = generateCards(bin, amount);
+        if (cards.length === 0) {
+          await sendMessage(env, chatId, "❌ Failed to generate cards", "HTML");
+          return new Response("ok");
+        }
+
         const list = cards.map(c => `<code>${c}</code>`).join("\n");
 
         await sendMessage(
           env,
           chatId,
-          `<b>Generated ${amount} Cards</b>\n<i>BIN: ${bin}</i>\n\n${list}`,
+          `<b>✅ Generated ${amount} Cards</b>\n<i>BIN: ${bin}</i>\n\n${list}`,
           "HTML"
         );
         return new Response("ok");
@@ -205,8 +274,12 @@ export default {
       // ————— /bin —————
       if (cmd === "/bin" && args[0]) {
         const bin = args[0].replace(/\D/g, "").slice(0, 6);
+        if (bin.length < 6) {
+          await sendMessage(env, chatId, "❌ Invalid BIN (minimum 6 digits required)", "HTML");
+          return new Response("ok");
+        }
         const info = await getBinInfo(bin);
-        await sendMessage(env, chatId, `<b>BIN Lookup</b>\n\n${info}`, "HTML");
+        await sendMessage(env, chatId, `<b>🔍 BIN Lookup</b>\n\n${info}`, "HTML");
         return new Response("ok");
       }
 
@@ -216,25 +289,30 @@ export default {
           .split("\n")
           .map(l => l.trim())
           .filter(l => /^\d{15,19}\|\d{2}\|\d{2,4}\|\d{3,4}$/.test(l))
-          .slice(0, 30); // max 30
+          .slice(0, 30);
 
         if (lines.length === 0) {
-          await sendMessage(env, chatId, "Send cards in format:\n<code>6011201234567890|07|32|839</code>", "HTML");
+          await sendMessage(
+            env, 
+            chatId, 
+            "<b>ℹ️ Send cards in format:</b>\n<code>6011201234567890|07|32|839</code>\n\n<i>You can send multiple cards, one per line</i>", 
+            "HTML"
+          );
           return new Response("ok");
         }
 
         const startMsg = await sendMessage(
           env,
           chatId,
-          `<b>Mass Checking Started!</b>\n` +
-          `Cards: ${lines.length}\n` +
-          `Gateway: Mock Payate\n` +
-          `Status: <i>0/${lines.length} checked...</i>`,
+          `<b>🔄 Mass Checking Started!</b>\n\n` +
+          `<b>Cards:</b> ${lines.length}\n` +
+          `<b>Gateway:</b> Mock Payate\n` +
+          `<b>Status:</b> <i>0/${lines.length} checked...</i>`,
           "HTML"
         );
 
         const messageId = (startMsg as any).result.message_id;
-        const startTime = performance.now();
+        const startTime = Date.now();
 
         let live = 0, die = 0, unknown = 0, error = 0;
         const results: string[] = [];
@@ -248,53 +326,57 @@ export default {
           else if (res.status === "unknown") unknown++;
           else error++;
 
-          const icon = res.status === "live" ? "Approved" : res.status === "die" ? "Declined" : res.status === "unknown" ? "Unknown" : "Warning";
+          const icon = res.status === "live" ? "✅" : res.status === "die" ? "❌" : res.status === "unknown" ? "⚠️" : "🚫";
+          const statusText = res.status === "live" ? "Approved" : res.status === "die" ? "Declined" : res.status === "unknown" ? "Unknown" : "Error";
+          
           results.push(
-            `<b>${icon}</b> | <code>${card}</code>\n${res.binInfo}`
+            `${icon} <b>${statusText}</b>\n<code>${card}</code>\n${res.binInfo}`
           );
 
-          // Update progress every 3 cards
+          // Update progress every 3 cards or on last card
           if (i % 3 === 2 || i === lines.length - 1) {
-            const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
             await editMessage(
               env,
               chatId,
               messageId,
-              `<b>Mass Checking In Progress...</b>\n` +
-              `Cards: ${lines.length}\n` +
-              `Time: ${elapsed}s\n` +
-              `Gateway: Mock Payate\n\n` +
-              `Approved ${live} Approved\n` +
-              `Declined ${die} Declined\n` +
-              `Unknown ${unknown} Unknown\n` +
-              `Errors ${error} Warning\n\n` +
-              `<i>Checked: ${i + 1}/${lines.length}</i>`,
+              `<b>🔄 Mass Checking In Progress...</b>\n\n` +
+              `<b>Cards:</b> ${lines.length}\n` +
+              `<b>Time:</b> ${elapsed}s\n` +
+              `<b>Gateway:</b> Mock Payate\n\n` +
+              `✅ Approved: ${live}\n` +
+              `❌ Declined: ${die}\n` +
+              `⚠️ Unknown: ${unknown}\n` +
+              `🚫 Errors: ${error}\n\n` +
+              `<i>Progress: ${i + 1}/${lines.length}</i>`,
               "HTML"
             );
           }
         }
 
-        const totalTime = ((performance.now() - startTime) / 1000).toFixed(2);
+        const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
 
-        const final = `
-*Mass Checking Completed!*
-Total Cards: ${lines.length}
-Time Taken: ${totalTime}s
-Gateway: Mock Payate
+        const final = `<b>✅ Mass Checking Completed!</b>
 
-Approved ${live} Approved
-Declined ${die} Declined
-Unknown ${unknown} Unknown
-Errors ${error} Warning
+<b>Total Cards:</b> ${lines.length}
+<b>Time Taken:</b> ${totalTime}s
+<b>Gateway:</b> Mock Payate
 
-${results.join("\n\n")}
-        `.trim();
+<b>Results:</b>
+✅ Approved: ${live}
+❌ Declined: ${die}
+⚠️ Unknown: ${unknown}
+🚫 Errors: ${error}
 
-        await editMessage(env, chatId, messageId, final, "Markdown");
+━━━━━━━━━━━━━━━━━━━━
+
+${results.join("\n\n━━━━━━━━━━━━━━━━━━━━\n\n")}`;
+
+        await editMessage(env, chatId, messageId, final, "HTML");
         return new Response("ok");
       }
 
-      await sendMessage(env, chatId, "Unknown command. Use /start");
+      await sendMessage(env, chatId, "❌ Unknown command. Use /start", "HTML");
       return new Response("ok");
     }
 
