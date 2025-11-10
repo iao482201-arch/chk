@@ -1,313 +1,303 @@
-export interface Env {
+import { sendMessage, editMessage, answerCallback } from "./telegram";
+
+interface Env {
   TELEGRAM_TOKEN: string;
-  MY_BUCKET: R2Bucket;
+  MOCK_GATEWAY: string;
+  BIN_API: string;
+  RATE_KV?: KVNamespace;
 }
 
-// === BIN RANGES (neapay.com) ===
-const BIN_RANGES: Record<string, [string, string][]> = {
-  visa: [["400000", "499999"]],
-  mastercard: [["222100", "272000"], ["510000", "559999"]],
-  american_express: [["340000", "349999"], ["370000", "399999"]],
-  diners: [["300000", "305999"], ["360000", "369999"], ["540000", "549999"]],
-  discover: [["601100", "601199"], ["622126", "622925"], ["644000", "649999"], ["650000", "659999"]],
-  jcb: [["352800", "358999"]],
-  cup: [["620000", "629999"]]
-};
-
-const SCHEME_LENGTHS: Record<string, number> = {
-  visa: 16,
-  mastercard: 16,
-  american_express: 15,
-  diners: 14,
-  discover: 16,
-  jcb: 16,
-  cup: 16
-};
-
-// === LUHN (pre-computed) ===
-const DOUBLE = Uint8Array.from({ length: 10 }, (_, i) => (i * 2 > 9 ? i * 2 - 9 : i * 2));
-
-function luhnChecksum(digits: Uint8Array): number {
-  let sum = 0, alt = false;
-  for (let i = digits.length - 1; i >= 0; i--) {
-    let d = digits[i];
-    if (alt) d = DOUBLE[d];
-    sum += d;
-    alt = !alt;
+// ———————————————————————— Luhn Algorithm ————————————————————————
+function luhnGenerate(prefix: string, length: number): string {
+  let number = prefix;
+  while (number.length < length - 1) {
+    number += Math.floor(Math.random() * 10);
   }
-  return (10 - (sum % 10)) % 10;
+  let sum = 0;
+  let alternate = true;
+  for (let i = number.length - 1; i >= 0; i--) {
+    let digit = parseInt(number[i]);
+    if (alternate) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+    alternate = !alternate;
+  }
+  const check = (10 - (sum % 10)) % 10;
+  return number + check;
 }
 
-// === BATCH GENERATOR ===
-function generateBatch(bin: string, count: number, length: number): string[] {
-  const binDigits = bin.split('').map(Number);
-  const prefixLen = binDigits.length;
-  const fillLen = length - prefixLen - 1;
-  const cards: string[] = [];
-  const rnd = new Uint8Array(fillLen);
+// ———————————————————————— BIN Lookup ————————————————————————
+interface BinData {
+  number: { iin: string; length: number; luhn: boolean };
+  scheme: string;
+  type: string;
+  category: string;
+  bank: { name?: string; phone?: string; url?: string };
+  country: { name: string; emoji: string };
+  success: boolean;
+}
 
-  for (let i = 0; i < count; i++) {
-    crypto.getRandomValues(rnd);
-    const card = new Uint8Array(length);
-    card.set(binDigits, 0);
-    card.set(rnd, prefixLen);
-    card[length - 1] = luhnChecksum(card);
-    cards.push(Array.from(card).join(''));
+async function getBinInfo(bin: string): Promise<string> {
+  try {
+    const res = await fetch(`https://binlist.io/lookup/${bin}/`);
+    if (!res.ok) return "❌ BIN lookup failed";
+    const data: BinData = await res.json();
+
+    if (!data.success) return "❌ BIN not found";
+
+    return (
+      `<b>BIN:</b> <code>${bin}</code>\n` +
+      `<b>Scheme:</b> ${data.scheme || "—"} • <b>Type:</b> ${data.type || "—"}\n` +
+      `<b>Category:</b> ${data.category || "—"}\n` +
+      `<b>Bank:</b> ${data.bank.name || "—"}\n` +
+      `<b>Country:</b> ${data.country.emoji} ${data.country.name}`
+    );
+  } catch {
+    return "⚠️ BIN lookup error";
+  }
+}
+
+// ———————————————————————— Card Checker ————————————————————————
+async function checkCard(env: Env, card: string): Promise<{
+  status: "live" | "die" | "unknown" | "error";
+  message: string;
+  binInfo: string;
+}> {
+  const [cc, mm, yy, cvv] = card.split("|");
+  if (!cc || !mm || !yy || !cvv) return { status: "error", message: "Invalid format", binInfo: "" };
+
+  const body = `data=${cc}|${mm}|${yy}|${cvv}`;
+
+  try {
+    const res = await fetch(env.MOCK_GATEWAY, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "x-requested-with": "XMLHttpRequest",
+        accept: "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Chromium";v="107", "Not=A?Brand";v="24"',
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"Android"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        referrer: "https://mock.payate.com/",
+      },
+      body,
+    });
+
+    if (!res.ok) return { status: "error", message: "Gateway error", binInfo: "" };
+
+    const json: any = await res.json();
+    const html = json.msg || "";
+
+    const bin = cc.slice(0, 6);
+    const binInfo = await getBinInfo(bin);
+
+    // Parse response
+    if (html.includes("color:#008000") && html.includes("Live")) {
+      return { status: "live", message: html.replace(/<[^>]*>/g, "").trim(), binInfo };
+    } else if (html.includes("color:#FF0000") && html.includes("Die")) {
+      return { status: "die", message: html.replace(/<[^>]*>/g, "").trim(), binInfo };
+    } else if (html.includes("color:#800080") && html.includes("Unknown")) {
+      return { status: "unknown", message: html.replace(/<[^>]*>/g, "").trim(), binInfo };
+    } else {
+      return { status: "error", message: "Unknown response", binInfo };
+    }
+  } catch (e) {
+    return { status: "error", message: "Request failed", binInfo: "" };
+  }
+}
+
+// ———————————————————————— Generate Cards ————————————————————————
+function generateCards(bin: string, amount: number): string[] {
+  const cards: string[] = [];
+  const length = 16;
+  const prefix = bin.padEnd(length, "0").slice(0, length);
+
+  for (let i = 0; i < amount; i++) {
+    const cc = luhnGenerate(prefix.slice(0, length - 1), length);
+    const mm = String(Math.floor(Math.random() * 12) + 1).padStart(2, "0");
+    const yy = String(26 + Math.floor(Math.random() * 8)).padStart(2, "0");
+    const cvv = String(100 + Math.floor(Math.random() * 900));
+    cards.push(`${cc}|${mm}|${yy}|${cvv}`);
   }
   return cards;
 }
 
-function formatCard(num: string, scheme: string): string {
-  const cvvLen = scheme === 'american_express' ? 4 : 3;
-  const cvv = Math.floor(100 + Math.random() * 900).toString().padStart(cvvLen, '0');
-  return `${num.slice(0,4)} ${num.slice(4,8)} ${num.slice(8,12)} ${num.slice(12)} | 12/29 | ${cvv}`;
-}
-
-// === SCHEME DETECTION ===
-function detectScheme(bin6: string): { scheme: string | null; valid: boolean } {
-  for (const [scheme, ranges] of Object.entries(BIN_RANGES)) {
-    for (const [start, end] of ranges) {
-      if (bin6 >= start && bin6 <= end) {
-        return { scheme, valid: true };
-      }
-    }
-  }
-  return { scheme: null, valid: false };
-}
-
-function randomBin(scheme: string): string {
-  const ranges = BIN_RANGES[scheme];
-  const [start, end] = ranges[Math.floor(Math.random() * ranges.length)];
-  const n = parseInt(start) + Math.floor(Math.random() * (parseInt(end) - parseInt(start) + 1));
-  return n.toString().padStart(6, '0');
-}
-
-// === BIN LOOKUP (fallback to ranges) ===
-async function lookupBin(bin6: string): Promise<{
-  scheme: string;
-  length: number;
-  bank?: string;
-  country?: string;
-  suggested?: string;
-} | null> {
-  const { scheme: detected, valid } = detectScheme(bin6);
-  if (!detected) return null;
-
-  try {
-    const res = await fetch(`https://binlist.io/lookup/${bin6}/`, {
-      headers: { 'User-Agent': 'CCGenBot/1' }
-    });
-    if (!res.ok) throw 0;
-    const data: any = await res.json();
-    if (!data.success && !data.guess) throw 0;
-
-    return {
-      scheme: data.scheme?.toLowerCase() ?? detected,
-      length: data.number?.length ?? SCHEME_LENGTHS[detected],
-      bank: data.bank?.name,
-      country: data.country?.emoji + ' ' + data.country?.name,
-      suggested: valid ? undefined : randomBin(detected)
-    };
-  } catch {
-    return {
-      scheme: detected,
-      length: SCHEME_LENGTHS[detected],
-      suggested: valid ? undefined : randomBin(detected)
-    };
-  }
-}
-
-function formatBinInfo(info: any, bin: string): string {
-  const { scheme, length, bank, country, suggested } = info;
-  let msg = `
-*BIN Lookup* (${scheme.toUpperCase()})
-
-**BIN:** \`${bin}\`
-**Length:** ${length}
-**Scheme:** ${scheme.toUpperCase()}
-**Bank:** ${bank ?? '—'}
-**Country:** ${country ?? '—'}
-  `.trim();
-  if (suggested) msg += `\n\n*Using suggested BIN:* \`${suggested}\``;
-  return msg;
-}
-
-// === TELEGRAM ===
-async function tgSend(chatId: number, text: string, env: Env, md = true) {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: md ? 'Markdown' : undefined })
-  });
-}
-
-async function tgSendFile(chatId: number, url: string, filename: string, env: Env) {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendDocument`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      document: url,
-      caption: `*${filename}*`,
-      parse_mode: 'Markdown'
-    })
-  });
-}
-
-// === RATE LIMIT (per request) ===
-const RATE_LIMIT = new Map<number, number>();
-
-// === MAIN HANDLER ===
+// ———————————————————————— Main Handler ————————————————————————
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // === SERVE R2 FILES ===
-    if (url.pathname.startsWith('/gen/')) {
-      const obj = await env.MY_BUCKET.get(url.pathname.slice(1));
-      if (!obj) return new Response('Not found', { status: 404 });
-      const headers = new Headers();
-      obj.writeHttpMetadata(headers);
-      headers.set('Access-Control-Allow-Origin', '*');
-      headers.set('Cache-Control', 'public, max-age=31536000');
-      return new Response(obj.body, { headers });
-    }
+    if (url.pathname === "/webhook" && request.method === "POST") {
+      const update: any = await request.json();
+      const msg = update.message;
+      const callback = update.callback_query;
 
-    // === WEBHOOK ===
-    if (url.pathname === '/webhook' && request.method === 'POST') {
-      const upd: any = await request.json();
-      const msg = upd.message;
-      if (!msg?.text || !msg.from) return new Response('OK');
+      if (callback) {
+        await answerCallback(env, callback.id);
+        return new Response("ok");
+      }
+
+      if (!msg?.text) return new Response("ok");
 
       const chatId = msg.chat.id;
-      const userId = msg.from.id;
       const text = msg.text.trim();
+      const userId = msg.from.id;
+      const [cmd, ...args] = text.split(/\s+/);
 
-      // Rate limit
-      const now = Date.now();
-      const last = RATE_LIMIT.get(userId);
-      if (last && now - last < 12_000) {
-        await tgSend(chatId, 'Please wait 12 seconds.', env, false);
-        return new Response('OK');
-      }
-      RATE_LIMIT.set(userId, now);
-
-      // /start
-      if (text === '/start') {
-        const ranges = Object.entries(BIN_RANGES)
-          .map(([s, r]) => `• *${s.toUpperCase()}:* ${r.map(([a,b])=>`\`${a}\`–\`${b}\``).join(', ')}`)
-          .join('\n');
-        await tgSend(chatId, `
-*Accurate CC Generator*
-
-${ranges}
-
-*/bin 515462* → 10 test cards
-*/gen 515462 50000* → up to 50k cards
-
-< 20 → message | ≥ 20 → file
-*Test cards only.*
-        `, env);
-        return new Response('OK');
+      // Rate limit: 3 checks per minute
+      if (env.RATE_KV) {
+        const key = `rate:${userId}`;
+        const now = Date.now();
+        const recent = ((await env.RATE_KV.get(key, { type: "json" })) as number[]) || [];
+        const valid = recent.filter(t => now - t < 60_000);
+        if (valid.length > 3 && !["/start", "/help"].includes(cmd)) {
+          await sendMessage(env, chatId, "Rate limit: 3 commands/min");
+          return new Response("ok");
+        }
+        valid.push(now);
+        await env.RATE_KV.put(key, JSON.stringify(valid), { expirationTtl: 120 });
       }
 
-      // /bin
-      if (text.startsWith('/bin')) {
-        let bin = text.split(' ')[1]?.replace(/\D/g, '');
-        if (!bin || bin.length < 6) {
-          await tgSend(chatId, 'Usage: `/bin 515462`', env);
-          return new Response('OK');
-        }
-        bin = bin.slice(0, 6);
+      // ————— /start —————
+      if (cmd === "/start") {
+        const welcome = `
+*CC Checker & Generator Bot* 
 
-        const info = await lookupBin(bin);
-        if (!info) {
-          await tgSend(chatId, `Invalid BIN \`${bin}\`. See /start.`, env);
-          return new Response('OK');
-        }
+*Commands:*
+/gen bin amount – Generate cards
+/chk – Paste cards (cc|mm|yy|cvv)
+/bin bin – Lookup BIN info
 
-        const useBin = info.suggested || bin;
-        const cards = generateBatch(useBin, 10, info.length);
-        const lines = cards.map(c => formatCard(c, info.scheme));
-
-        const fullMsg = `${formatBinInfo(info, bin)}\n\n*10 Cards*\n\`\`\`\n${lines.join('\n')}\n\`\`\``;
-
-        if (lines.length < 20 && fullMsg.length <= 4000) {
-          await tgSend(chatId, fullMsg, env);
-        } else {
-          const key = `gen/${Date.now()}_${useBin}_10.txt`;
-          const stream = new ReadableStream({
-            start(ctrl) {
-              for (const line of lines) {
-                ctrl.enqueue(new TextEncoder().encode(line + '\n'));
-              }
-              ctrl.close();
-            }
-          });
-          await env.MY_BUCKET.put(key, stream);
-          const fileUrl = `${url.origin}/${key}`;
-          await tgSendFile(chatId, fileUrl, `${useBin}_10.txt`, env);
-          await tgSend(chatId, formatBinInfo(info, bin), env);
-        }
-        return new Response('OK');
+*Example:*  
+/gen 486796 10
+        `.trim();
+        await sendMessage(env, chatId, welcome, "Markdown");
+        return new Response("ok");
       }
 
-      // /gen
-      if (text.startsWith('/gen')) {
-        const parts = text.split(' ').slice(1);
-        let bin = parts[0]?.replace(/\D/g, '');
-        const count = Math.min(parseInt(parts[1]) || 10, 50_000);
-
-        if (!bin || bin.length < 6) {
-          await tgSend(chatId, 'Usage: `/gen 515462 50000`', env);
-          return new Response('OK');
-        }
-        bin = bin.slice(0, 6);
-
-        const { scheme: detected, valid } = detectScheme(bin);
-        if (!detected) {
-          await tgSend(chatId, `Invalid BIN \`${bin}\`. See /start.`, env);
-          return new Response('OK');
+      // ————— /gen —————
+      if (cmd === "/gen" && args.length >= 2) {
+        const bin = args[0].replace(/\D/g, "").slice(0, 6);
+        const amount = Math.min(parseInt(args[1]) || 10, 50);
+        if (bin.length < 6) {
+          await sendMessage(env, chatId, "Invalid BIN (min 6 digits)");
+          return new Response("ok");
         }
 
-        const useBin = valid ? bin : randomBin(detected);
-        const length = SCHEME_LENGTHS[detected];
+        const cards = generateCards(bin, amount);
+        const list = cards.map(c => `<code>${c}</code>`).join("\n");
 
-        await tgSend(chatId, `Generating *${count.toLocaleString()}* ${detected.toUpperCase()} cards…`, env);
+        await sendMessage(
+          env,
+          chatId,
+          `<b>Generated ${amount} Cards</b>\n<i>BIN: ${bin}</i>\n\n${list}`,
+          "HTML"
+        );
+        return new Response("ok");
+      }
 
-        const key = `gen/${Date.now()}_${useBin}_${count}.txt`;
-        const stream = new ReadableStream({
-          async start(ctrl) {
-            const batchSize = 5_000;
-            for (let i = 0; i < count; i += batchSize) {
-              const take = Math.min(batchSize, count - i);
-              const batch = generateBatch(useBin, take, length);
-              for (const card of batch) {
-                ctrl.enqueue(new TextEncoder().encode(formatCard(card, detected) + '\n'));
-              }
-              await new Promise(r => setTimeout(r, 0)); // yield
-            }
-            ctrl.close();
+      // ————— /bin —————
+      if (cmd === "/bin" && args[0]) {
+        const bin = args[0].replace(/\D/g, "").slice(0, 6);
+        const info = await getBinInfo(bin);
+        await sendMessage(env, chatId, `<b>BIN Lookup</b>\n\n${info}`, "HTML");
+        return new Response("ok");
+      }
+
+      // ————— /chk —————
+      if (cmd === "/chk") {
+        const lines = text
+          .split("\n")
+          .map(l => l.trim())
+          .filter(l => /^\d{15,19}\|\d{2}\|\d{2,4}\|\d{3,4}$/.test(l))
+          .slice(0, 30); // max 30
+
+        if (lines.length === 0) {
+          await sendMessage(env, chatId, "Send cards in format:\n<code>6011201234567890|07|32|839</code>", "HTML");
+          return new Response("ok");
+        }
+
+        const startMsg = await sendMessage(
+          env,
+          chatId,
+          `<b>Mass Checking Started!</b>\n` +
+          `Cards: ${lines.length}\n` +
+          `Gateway: Mock Payate\n` +
+          `Status: <i>0/${lines.length} checked...</i>`,
+          "HTML"
+        );
+
+        const messageId = (startMsg as any).result.message_id;
+        const startTime = performance.now();
+
+        let live = 0, die = 0, unknown = 0, error = 0;
+        const results: string[] = [];
+
+        for (let i = 0; i < lines.length; i++) {
+          const card = lines[i];
+          const res = await checkCard(env, card);
+
+          if (res.status === "live") live++;
+          else if (res.status === "die") die++;
+          else if (res.status === "unknown") unknown++;
+          else error++;
+
+          const icon = res.status === "live" ? "Approved" : res.status === "die" ? "Declined" : res.status === "unknown" ? "Unknown" : "Warning";
+          results.push(
+            `<b>${icon}</b> | <code>${card}</code>\n${res.binInfo}`
+          );
+
+          // Update progress every 3 cards
+          if (i % 3 === 2 || i === lines.length - 1) {
+            const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+            await editMessage(
+              env,
+              chatId,
+              messageId,
+              `<b>Mass Checking In Progress...</b>\n` +
+              `Cards: ${lines.length}\n` +
+              `Time: ${elapsed}s\n` +
+              `Gateway: Mock Payate\n\n` +
+              `Approved ${live} Approved\n` +
+              `Declined ${die} Declined\n` +
+              `Unknown ${unknown} Unknown\n` +
+              `Errors ${error} Warning\n\n` +
+              `<i>Checked: ${i + 1}/${lines.length}</i>`,
+              "HTML"
+            );
           }
-        });
-
-        await env.MY_BUCKET.put(key, stream, { httpMetadata: { contentType: 'text/plain' } });
-        const fileUrl = `${url.origin}/${key}`;
-
-        if (count < 20) {
-          const sample = generateBatch(useBin, count, length).map(c => formatCard(c, detected)).join('\n');
-          await tgSend(chatId, `*${count} Cards*\n\`\`\`\n${sample}\n\`\`\`\n[Full](${fileUrl})`, env);
-        } else {
-          await tgSendFile(chatId, fileUrl, `${useBin}_${count}.txt`, env);
-          await tgSend(chatId, `File ready: [${useBin}_${count}.txt](${fileUrl})`, env);
         }
 
-        return new Response('OK');
+        const totalTime = ((performance.now() - startTime) / 1000).toFixed(2);
+
+        const final = `
+*Mass Checking Completed!*
+Total Cards: ${lines.length}
+Time Taken: ${totalTime}s
+Gateway: Mock Payate
+
+Approved ${live} Approved
+Declined ${die} Declined
+Unknown ${unknown} Unknown
+Errors ${error} Warning
+
+${results.join("\n\n")}
+        `.trim();
+
+        await editMessage(env, chatId, messageId, final, "Markdown");
+        return new Response("ok");
       }
 
-      return new Response('OK');
+      await sendMessage(env, chatId, "Unknown command. Use /start");
+      return new Response("ok");
     }
 
-    return new Response('CC Gen Bot + R2 + Accurate BINs');
-  }
+    return new Response("CC Checker Bot – POST /webhook");
+  },
 };
