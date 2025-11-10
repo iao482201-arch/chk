@@ -1,52 +1,86 @@
 /**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
+ * wrangler.jsonc – Full configuration for CC Checker Bot
+ * Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
  */
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "chk",
-	"main": "src/index.ts",
-	"compatibility_date": "2025-11-07",
-	"compatibility_flags": [
-		"nodejs_compat"
-	],
-	"observability": {
-		"enabled": true
-	}
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "chk",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-11-10",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
 
-	/**
-	 * Smart Placement
-	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
-	 */
-	// "placement": { "mode": "smart" }
+  /**
+   * Observability – Logs & Errors in Cloudflare Dashboard
+   */
+  "observability": {
+    "enabled": true
+  },
 
-	/**
-	 * Bindings
-	 * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
-	 * databases, object storage, AI inference, real-time communication and more.
-	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
-	 */
+  /**
+   * Smart Placement – Optional (reduces latency)
+   * Uncomment to enable
+   */
+  // "placement": { "mode": "smart" },
 
-	/**
-	 * Environment Variables
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
-	 */
-	// "vars": { "MY_VARIABLE": "production_value" }
+  /**
+   * Environment Variables (non-sensitive)
+   */
+  "vars": {
+    "MOCK_GATEWAY": "https://mock.payate.com/api.php",
+    "BIN_API": "https://binlist.io/lookup"
+  },
 
-	/**
-	 * Note: Use secrets to store sensitive data.
-	 * https://developers.cloudflare.com/workers/configuration/secrets/
-	 */
+  /**
+   * Secrets – Use `wrangler secret put TELEGRAM_TOKEN`
+   * Run: wrangler secret put TELEGRAM_TOKEN
+   */
+  // TELEGRAM_TOKEN will be injected at runtime via secret
 
-	/**
-	 * Static Assets
-	 * https://developers.cloudflare.com/workers/static-assets/binding/
-	 */
-	// "assets": { "directory": "./public/", "binding": "ASSETS" }
+  /**
+   * KV Namespace – For BIN caching
+   * Create with: wrangler kv:namespace create BIN_CACHE
+   */
+  "kv_namespaces": [
+    {
+      "binding": "BIN_CACHE",
+      "id": "39fbba6d12bb488488f025a9dd9b2279",
+      "preview_id": "39fbba6d12bb488488f025a9dd9b2279"
+    }
+  ],
 
-	/**
-	 * Service Bindings (communicate between multiple Workers)
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
-	 */
-	// "services": [{ "binding": "MY_SERVICE", "service": "my-service" }]
+  /**
+   * Durable Objects – Per-user state & rate limiting
+   * Create class in src/do/UserState.ts
+   */
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_STATE",
+        "class_name": "UserState"
+      }
+    ]
+  },
+
+  /**
+   * Migration – Required to deploy Durable Object
+   * Run once after adding DO
+   */
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["UserState"]
+    }
+  ]
+
+  /**
+   * Static Assets (optional)
+   */
+  // "assets": { "directory": "./public/", "binding": "ASSETS" }
+
+  /**
+   * Service Bindings (optional)
+   */
+  // "services": [{ "binding": "MY_SERVICE", "service": "my-service" }]
 }
