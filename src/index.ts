@@ -1,6 +1,8 @@
 import { Telegraf } from "telegraf";
 import { UserState } from "./do/UserState";
 
+export { UserState };
+
 interface Env {
   TELEGRAM_TOKEN: string;
   MOCK_GATEWAY: string;
